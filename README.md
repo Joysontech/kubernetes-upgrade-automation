@@ -17,7 +17,7 @@ This is running on my personal homelab: an 8-node bare metal cluster (3 control 
 | Layer | Tool | Role |
 |-------|------|------|
 | Orchestration | GitHub Actions | Scheduling, triggers, approvals |
-| AI | Claude Code | Changelog analysis, pre/post-upgrade fixes, diagnosis |
+| AI | Claude Code CLI | Changelog analysis, pre/post-upgrade fixes, diagnosis |
 | Execution | Ansible | Sequential node-by-node upgrade |
 | Notifications | Discord | Per-node progress, reports, approval links |
 
@@ -29,12 +29,12 @@ GitHub Actions (Saturday 03:00 UTC)
     ├─ version-check.yaml
     │   ├─ New patch >7 days old?  → Auto-trigger upgrade-cluster.yaml
     │   ├─ New patch <7 days old?  → Discord: "Available, waiting N days"
-    │   ├─ New minor, patch ≥ .2?  → Claude Code analysis → Discord report + approval link
+    │   ├─ New minor, patch ≥ .2?  → Claude Code session → Discord report + approval link
     │   └─ No updates              → Silent
     │
     └─ upgrade-cluster.yaml (triggered by version-check or manual)
         ├─ Pre-flight: node health, etcd quorum, pod checks
-        ├─ Pre-upgrade fixes: Claude Code executes checklist (minor only)
+        ├─ Pre-upgrade fixes: Claude Code session executes checklist (minor only)
         ├─ Upgrade: Ansible playbook (sequential CP → workers)
         ├─ Post-upgrade: verify nodes, pods, ArgoCD, Vault unseal
         └─ Discord: full report with run link
@@ -55,30 +55,40 @@ Four consecutive minor version upgrades in a single day, fully automated.
 
 ## How AI is Used
 
-Claude Code runs at three points in the pipeline:
+There is no direct Anthropic API integration in this pipeline. Instead, GitHub Actions shells out to the **Claude Code CLI** (`claude`), which spawns a full agentic Claude Code session on the self-hosted runner. Claude Code handles everything within that session autonomously — running `kubectl`, editing files, making web requests, committing to Git — before returning control to the workflow.
 
-**1. Minor version analysis (version-check.yaml)**
-When a new minor version is detected, Claude Code:
+Claude Code sessions run at three points in the pipeline:
+
+**1. Minor version analysis (`version-check.yaml`)**
+When a new minor version is detected, a Claude Code session:
 - Fetches and reads the full Kubernetes changelog
-- Scans the cluster for deprecated API usage
+- Scans the cluster for deprecated API usage via `kubectl`
 - Checks Cilium, Rook-Ceph, and Vault compatibility matrices
-- Writes a pre-upgrade checklist to disk
+- Writes a pre-upgrade checklist to `/tmp/k8s-upgrade-checklist-vX.Y.Z.txt`
 - Posts a detailed report to Discord with an approval link
 
-**2. Pre-upgrade fixes (upgrade-cluster.yaml, minor only)**
-After approval, Claude Code executes the checklist:
+**2. Pre-upgrade fixes (`upgrade-cluster.yaml`, minor only)**
+After approval, a Claude Code session executes the checklist:
 - Upgrades CNI if incompatible with the target version
 - Fixes deprecated APIs in manifests
-- Commits changes and waits for ArgoCD to sync
+- Commits and pushes changes, then waits for ArgoCD to sync
 
-**3. Post-upgrade diagnosis (upgrade-cluster.yaml)**
-After Ansible completes, Claude Code:
+**3. Post-upgrade diagnosis (`upgrade-cluster.yaml`)**
+After Ansible completes, a Claude Code session:
 - Verifies all nodes are on the target version
 - Checks for unhealthy pods and diagnoses issues
 - Confirms ArgoCD apps are Synced and Healthy
 - Posts a final report to Discord
 
-> **Note on `--dangerously-skip-permissions`:** Claude Code is run with this flag in the GitHub Actions environment because it needs to execute kubectl commands and edit files without interactive prompts. It runs inside a self-hosted runner with access scoped to the cluster — it does not have access to your host system or broader network.
+The invocation pattern in each workflow step looks like this:
+```bash
+claude --dangerously-skip-permissions -p "
+  Your task description here...
+  Post results to Discord webhook $DISCORD_UPGRADE_WEBHOOK
+" 2>&1 || true
+```
+
+> **Note on `--dangerously-skip-permissions`:** This flag allows Claude Code to run non-interactively without confirmation prompts for each action. It is required in a CI environment where there is no human at the keyboard. Claude Code runs inside a self-hosted runner with network and filesystem access scoped to the cluster — review what access your runner has before enabling this.
 
 ## Quick Start
 
@@ -86,18 +96,19 @@ After Ansible completes, Claude Code:
 
 On your self-hosted GitHub Actions runner:
 ```bash
-kubectl              # with kubeconfig for your cluster
-ansible              # for running playbooks
-claude               # Anthropic Claude Code CLI — https://claude.ai/code
-gh                   # GitHub CLI (authenticated to this repo)
-ssh                  # key-based access to all cluster nodes
+kubectl   # with kubeconfig for your cluster
+ansible   # for running playbooks
+claude    # Claude Code CLI — https://claude.ai/code
+gh        # GitHub CLI (authenticated to this repo)
+ssh       # key-based access to all cluster nodes
 ```
 
-Claude Code also requires an `ANTHROPIC_API_KEY` environment variable on your runner:
+Claude Code must be authenticated on your runner. Log in once interactively:
 ```bash
-# Add to your runner's environment or systemd service
-export ANTHROPIC_API_KEY=sk-ant-...
+claude login
 ```
+
+This stores credentials locally on the runner. The `claude` CLI will use them for all subsequent non-interactive sessions triggered by GitHub Actions.
 
 ### 2. Clone and configure
 
@@ -126,13 +137,13 @@ Set in repo → Settings → Secrets and variables → Actions:
 
 ### 4. Set your paths
 
-In `.github/workflows/upgrade-cluster.yaml`, set `K8S_UPGRADE_DIR` to the path where this repo is cloned on your runner.
+In `.github/workflows/upgrade-cluster.yaml`, set `K8S_UPGRADE_DIR` to where this repo is cloned on your runner.
 
 In `.github/workflows/version-check.yaml`, set `RUNNER_USER` and `RUNNER_IP` to your runner host.
 
 ### 5. Set up the approval server (minor upgrades only)
 
-Minor version upgrades require a one-click approval. The workflow posts a Discord message with a link to `http://YOUR_RUNNER_IP:9095/approve?version=vX.Y.Z`. Clicking it creates a file at `/tmp/k8s-upgrade-approved` on your runner host, which the next version check picks up.
+Minor version upgrades require a one-click approval. The Claude Code session posts a Discord message with a link to `http://YOUR_RUNNER_IP:9095/approve?version=vX.Y.Z`. Clicking it creates `/tmp/k8s-upgrade-approved` on your runner host, which the next Sunday version check picks up and uses to trigger the upgrade.
 
 A minimal approval server (Python):
 ```python
@@ -201,7 +212,7 @@ Phase 4: Post-Upgrade
 
 ```
 1. Version check detects vX.Y+1.2 (patch ≥ .2 — community has had time to find bugs)
-   Claude Code: fetch changelog → scan deprecated APIs → check CNI/storage/Vault compat
+   Claude Code session: fetch changelog → scan deprecated APIs → check CNI/storage/Vault compat
    → Writes checklist to /tmp/k8s-upgrade-checklist-vX.Y+1.2.txt
    → Discord: detailed report + approval link
 
@@ -210,12 +221,12 @@ Phase 4: Post-Upgrade
 
 3. Next Sunday version check picks up the marker
    → Triggers upgrade-cluster.yaml with run_pre_fixes=true
-   → Claude Code: executes checklist (fix deprecations, upgrade CNI if needed, commit + push)
+   → Claude Code session: executes checklist (fix deprecations, upgrade CNI if needed, commit + push)
    → Waits for ArgoCD to sync
 
 4. Ansible runs sequential upgrade (CP → workers)
 
-5. Claude Code: post-upgrade verification
+5. Claude Code session: post-upgrade verification
    → Discord: "Upgrade complete — all nodes on vX.Y+1.2"
 ```
 
