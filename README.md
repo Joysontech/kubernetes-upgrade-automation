@@ -1,8 +1,16 @@
 # Kubernetes Cluster Upgrade Automation
 
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Kubernetes](https://img.shields.io/badge/kubernetes-v1.35-326CE5?logo=kubernetes&logoColor=white)
+![Ansible](https://img.shields.io/badge/ansible-automation-EE0000?logo=ansible&logoColor=white)
+![Claude Code](https://img.shields.io/badge/AI-Claude_Code-8A2BE2)
+![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-CI%2FCD-2088FF?logo=githubactions&logoColor=white)
+
 AI-powered Kubernetes cluster upgrades for bare metal homelabs.
 
 GitHub Actions pipelines detect new versions weekly, auto-upgrade patches, and orchestrate minor version upgrades with **Claude Code AI analysis and approval workflows** — all backed by Ansible playbooks.
+
+This is running on my personal homelab: an 8-node bare metal cluster (3 control plane + 5 workers) running Cilium, Rook-Ceph, ArgoCD, and Vault.
 
 ## Stack
 
@@ -32,18 +40,45 @@ GitHub Actions (Saturday 03:00 UTC)
         └─ Discord: full report with run link
 ```
 
-## Cluster Compatibility
+## Upgrade History
 
-Designed for **kubeadm-managed bare metal clusters**. Tested on:
+This system has been running in production on my homelab:
 
-- 8-node cluster (3 control plane + 5 workers)
-- Cilium CNI (kube-proxy replacement, VXLAN mode)
-- Rook-Ceph storage
-- kube-vip (HA control plane VIP)
-- ArgoCD (GitOps, App-of-Apps)
-- HashiCorp Vault (auto-unseal after drains)
+| Date | From | To | Notes |
+|------|------|----|-------|
+| 2026-04-05 | v1.31.14 | v1.32.13 | First automated upgrade |
+| 2026-04-05 | v1.32.13 | v1.33.10 | |
+| 2026-04-05 | v1.33.10 | v1.34.6 | |
+| 2026-04-05 | v1.34.6 | v1.35.3 | Cilium v1.16.5 → v1.17.14 pre-upgrade fix by Claude Code |
 
-Adapt `inventory.ini` and `group_vars/all.yml` for your own setup.
+Four consecutive minor version upgrades in a single day, fully automated.
+
+## How AI is Used
+
+Claude Code runs at three points in the pipeline:
+
+**1. Minor version analysis (version-check.yaml)**
+When a new minor version is detected, Claude Code:
+- Fetches and reads the full Kubernetes changelog
+- Scans the cluster for deprecated API usage
+- Checks Cilium, Rook-Ceph, and Vault compatibility matrices
+- Writes a pre-upgrade checklist to disk
+- Posts a detailed report to Discord with an approval link
+
+**2. Pre-upgrade fixes (upgrade-cluster.yaml, minor only)**
+After approval, Claude Code executes the checklist:
+- Upgrades CNI if incompatible with the target version
+- Fixes deprecated APIs in manifests
+- Commits changes and waits for ArgoCD to sync
+
+**3. Post-upgrade diagnosis (upgrade-cluster.yaml)**
+After Ansible completes, Claude Code:
+- Verifies all nodes are on the target version
+- Checks for unhealthy pods and diagnoses issues
+- Confirms ArgoCD apps are Synced and Healthy
+- Posts a final report to Discord
+
+> **Note on `--dangerously-skip-permissions`:** Claude Code is run with this flag in the GitHub Actions environment because it needs to execute kubectl commands and edit files without interactive prompts. It runs inside a self-hosted runner with access scoped to the cluster — it does not have access to your host system or broader network.
 
 ## Quick Start
 
@@ -51,17 +86,23 @@ Adapt `inventory.ini` and `group_vars/all.yml` for your own setup.
 
 On your self-hosted GitHub Actions runner:
 ```bash
-kubectl   # with kubeconfig for your cluster
-ansible   # for running playbooks
-claude    # Anthropic Claude Code CLI (https://claude.ai/code)
-gh        # GitHub CLI (authenticated)
-ssh       # key-based access to all cluster nodes
+kubectl              # with kubeconfig for your cluster
+ansible              # for running playbooks
+claude               # Anthropic Claude Code CLI — https://claude.ai/code
+gh                   # GitHub CLI (authenticated to this repo)
+ssh                  # key-based access to all cluster nodes
+```
+
+Claude Code also requires an `ANTHROPIC_API_KEY` environment variable on your runner:
+```bash
+# Add to your runner's environment or systemd service
+export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 ### 2. Clone and configure
 
 ```bash
-git clone https://github.com/joyson-fernandes/kubernetes-upgrade-automation
+git clone https://github.com/joysontech/kubernetes-upgrade-automation
 cd kubernetes-upgrade-automation
 
 cp inventory.ini.example inventory.ini
@@ -73,27 +114,54 @@ Edit `group_vars/all.yml` with your target versions and Discord webhook.
 
 ### 3. GitHub Actions secrets
 
-Set in repo → Settings → Secrets:
+Set in repo → Settings → Secrets and variables → Actions:
 
 | Secret | Description |
 |--------|-------------|
-| `DISCORD_WEBHOOK` | Discord webhook URL for general alerts |
-| `DISCORD_UPGRADE_WEBHOOK` | Discord webhook URL for upgrade channel |
+| `DISCORD_UPGRADE_WEBHOOK` | Discord webhook URL for upgrade notifications |
 | `BECOME_PASS` | sudo password for Ansible become |
 
-### 4. Set your runner path
+> **Discord webhooks:** Create one in Discord → channel settings → Integrations → Webhooks.
+> The Ansible playbook also reads `discord_webhook` from `group_vars/all.yml` — set this to the same URL.
 
-In `.github/workflows/upgrade-cluster.yaml` set `K8S_UPGRADE_DIR` to where you cloned this repo on your runner.
+### 4. Set your paths
 
-In `.github/workflows/version-check.yaml` set `RUNNER_IP` and `RUNNER_USER`.
+In `.github/workflows/upgrade-cluster.yaml`, set `K8S_UPGRADE_DIR` to the path where this repo is cloned on your runner.
 
-### 5. Trigger
+In `.github/workflows/version-check.yaml`, set `RUNNER_USER` and `RUNNER_IP` to your runner host.
+
+### 5. Set up the approval server (minor upgrades only)
+
+Minor version upgrades require a one-click approval. The workflow posts a Discord message with a link to `http://YOUR_RUNNER_IP:9095/approve?version=vX.Y.Z`. Clicking it creates a file at `/tmp/k8s-upgrade-approved` on your runner host, which the next version check picks up.
+
+A minimal approval server (Python):
+```python
+# approval_server.py — run on your runner host
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        params = parse_qs(urlparse(self.path).query)
+        version = params.get("version", ["unknown"])[0]
+        with open("/tmp/k8s-upgrade-approved", "w") as f:
+            f.write(version)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(f"Approved: {version}".encode())
+
+HTTPServer(("0.0.0.0", 9095), Handler).serve_forever()
+```
+
+Run it as a systemd service or in a tmux session on your runner host.
+
+### 6. Trigger
 
 ```bash
-# Check for updates
+# Check for updates manually
 gh workflow run version-check.yaml
 
-# Manual upgrade
+# Trigger a specific upgrade manually
 gh workflow run upgrade-cluster.yaml \
   -f target_version=v1.35.4 \
   -f apt_version=1.35.4-1.1 \
@@ -112,47 +180,56 @@ Phase 1: Pre-Upgrade
   → Discord: "K8s Upgrade Starting"
 
 Phase 2: Control Plane (sequential, ~10 min each)
-  First CP: kubeadm upgrade apply vX.Y.Z → drain → kubelet upgrade → uncordon → verify
-  Remaining CPs: kubeadm upgrade node → drain → kubelet upgrade → uncordon → verify
-  → Discord: "Control Plane Upgraded — M01/M02/M03"
+  First CP:       kubeadm upgrade apply vX.Y.Z → drain → kubelet upgrade → uncordon → verify
+  Remaining CPs:  kubeadm upgrade node          → drain → kubelet upgrade → uncordon → verify
+  → Discord: "Control Plane Upgraded — M01 / M02 / M03"
 
 Phase 3: Workers (sequential, ~5 min each)
   Each worker: kubeadm upgrade node → drain → kubelet upgrade → uncordon → verify
-  → Discord: "Worker Upgraded — W01/W02/..."
+  → Discord: "Worker Upgraded — W01 / W02 / ..."
 
 Phase 4: Post-Upgrade
   ✓ All nodes on target version
   ✓ All pods Running/Completed
   ✓ ArgoCD apps Synced
   ✓ Vault auto-unseal if needed
-  ✓ Smoke test
+  ✓ Smoke test (create/delete nginx pod)
   → Discord: "K8s Upgrade Complete"
 ```
 
 ## Minor Version Flow
 
 ```
-1. Claude Code: fetch changelog → scan deprecated APIs → check CNI/storage/Vault compat
-   → Discord report + approval link
+1. Version check detects vX.Y+1.2 (patch ≥ .2 — community has had time to find bugs)
+   Claude Code: fetch changelog → scan deprecated APIs → check CNI/storage/Vault compat
+   → Writes checklist to /tmp/k8s-upgrade-checklist-vX.Y+1.2.txt
+   → Discord: detailed report + approval link
 
-2. You click approve → approval marker created on runner
+2. You click the approval link
+   → Approval marker created at /tmp/k8s-upgrade-approved on runner host
 
-3. Next weekly check picks up approval
-   → Claude Code: fix deprecations, upgrade CNI, commit + push, wait for ArgoCD
-   → Ansible: sequential upgrade
+3. Next Sunday version check picks up the marker
+   → Triggers upgrade-cluster.yaml with run_pre_fixes=true
+   → Claude Code: executes checklist (fix deprecations, upgrade CNI if needed, commit + push)
+   → Waits for ArgoCD to sync
 
-4. Claude Code: post-upgrade verification + Discord report
+4. Ansible runs sequential upgrade (CP → workers)
+
+5. Claude Code: post-upgrade verification
+   → Discord: "Upgrade complete — all nodes on vX.Y+1.2"
 ```
+
+> **Why wait for patch ≥ .2?** Kubernetes .0 and .1 releases often surface edge-case bugs quickly. Waiting for .2 means the community has already found and fixed the most common issues before your cluster upgrades.
 
 ## Important Constraints
 
-- **Never skip minor versions** — upgrade one at a time (1.34 → 1.35, not 1.34 → 1.36)
-- **kube-vip** — pin to a known-good version; static pods don't auto-upgrade
-- **Cilium** — always check the compatibility matrix before a minor upgrade
-- **Rook-Ceph** — ensure 2+ OSD nodes healthy during drain
-- **Vault** — may need auto-unseal after worker drains restart vault pods
+- **Never skip minor versions** — upgrade one at a time (1.34 → 1.35 → 1.36, never 1.34 → 1.36)
+- **kube-vip** — pin to a known-good version; static pod upgrades require manual intervention
+- **Cilium** — always check the [compatibility matrix](https://docs.cilium.io/en/stable/network/kubernetes/compatibility/) before a minor upgrade
+- **Rook-Ceph** — ensure 2+ OSD nodes are healthy at all times; drain pauses until volumes detach
+- **Vault** — may need auto-unseal after worker drains cause pod restarts; handled in post-upgrade job
 - **etcd quorum** — never upgrade more than 1 control plane node at a time
-- **Drain flags** — `--disable-eviction` bypasses PDBs; `--timeout=300s` for storage volume detach
+- **Drain flags** — `--disable-eviction` bypasses PDBs (e.g. Kyverno); `--timeout=300s` allows time for Rook-Ceph volume detach
 
 ## File Structure
 
@@ -160,22 +237,24 @@ Phase 4: Post-Upgrade
 kubernetes-upgrade-automation/
   .github/workflows/
     version-check.yaml        # Weekly version detection + auto-trigger
-    upgrade-cluster.yaml      # Full upgrade pipeline
-  ansible.cfg                 # forks=1, serial=1
+    upgrade-cluster.yaml      # Full upgrade pipeline (4 jobs)
+  ansible.cfg                 # forks=1, serial=1 (never parallel)
   inventory.ini.example       # Node inventory template → copy to inventory.ini
   group_vars/
     all.yml.example           # Variables template → copy to all.yml
   upgrade-cluster.yaml        # Ansible upgrade playbook
-  rollback.yaml               # Ansible emergency rollback
+  rollback.yaml               # Ansible emergency rollback playbook
   roles/
-    pre-upgrade/              # Health checks, etcd + PKI backup
-    upgrade-control-plane/    # CP upgrade (apply vs node)
-    upgrade-workers/          # Worker upgrade (drain + upgrade)
+    pre-upgrade/              # Health checks, etcd snapshot, PKI backup
+    upgrade-control-plane/    # CP upgrade (kubeadm apply vs node)
+    upgrade-workers/          # Worker drain + upgrade + uncordon
     post-upgrade/             # Verification + smoke test
-    rollback/                 # etcd restore + downgrade
+    rollback/                 # etcd restore + version downgrade
 ```
 
 ## Rollback
+
+If an upgrade goes wrong, restore from the etcd snapshot taken in Phase 1:
 
 ```bash
 ansible-playbook rollback.yaml \
