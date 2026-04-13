@@ -1,0 +1,5 @@
+# Never commit these — use the .example files instead
+inventory.ini
+group_vars/all.yml
+*.retry
+*.log

@@ -1,0 +1,207 @@
+name: K8s Cluster Upgrade
+
+# ── Configure this for your environment ──────────────────────────────────────
+# Set K8S_UPGRADE_DIR to where this repo is cloned on your runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: 'Target K8s version (e.g. v1.35.4)'
+        required: true
+      apt_version:
+        description: 'APT package version (e.g. 1.35.4-1.1)'
+        required: true
+      upgrade_type:
+        description: 'Upgrade type'
+        required: true
+        default: 'patch'
+        type: choice
+        options: [patch, minor]
+      run_pre_fixes:
+        description: 'Run Claude Code pre-upgrade fixes (minor upgrades)'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+  DISCORD_UPGRADE_WEBHOOK: ${{ secrets.DISCORD_UPGRADE_WEBHOOK }}
+  K8S_UPGRADE_DIR: /home/YOUR_USERNAME/kubernetes-upgrade-automation
+
+jobs:
+  pre-flight:
+    name: Pre-Flight Checks
+    runs-on: self-hosted
+    outputs:
+      healthy: ${{ steps.health.outputs.healthy }}
+    steps:
+      - name: Cluster health check
+        id: health
+        run: |
+          NOT_READY=$(kubectl get nodes --no-headers | grep -v ' Ready ' | wc -l)
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "healthy=false" >> $GITHUB_OUTPUT
+            echo "::error::Not all nodes are Ready"; exit 1
+          fi
+          CLB=$(kubectl get pods -A --no-headers | grep CrashLoopBackOff | wc -l)
+          if [ "$CLB" -gt 0 ]; then
+            echo "healthy=false" >> $GITHUB_OUTPUT
+            echo "::error::CrashLoopBackOff pods detected"; exit 1
+          fi
+          ETCD_POD=$(kubectl get pods -n kube-system -l component=etcd -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n kube-system "$ETCD_POD" -- etcdctl endpoint health --cluster 2>/dev/null || true
+          echo "healthy=true" >> $GITHUB_OUTPUT
+          echo "✅ Cluster healthy"
+
+      - name: Show current state
+        run: |
+          kubectl get nodes -o wide
+          echo "Target: ${{ inputs.target_version }} (${{ inputs.upgrade_type }})"
+
+      - name: Discord — starting
+        run: |
+          curl -s -X POST "$DISCORD_UPGRADE_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"🔄 **K8s Upgrade Starting** — ${{ inputs.upgrade_type }} → ${{ inputs.target_version }}\\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+
+  pre-upgrade-fixes:
+    name: Pre-Upgrade Fixes (Claude Code)
+    needs: pre-flight
+    runs-on: self-hosted
+    if: inputs.run_pre_fixes == true || inputs.run_pre_fixes == 'true'
+    steps:
+      - name: Run Claude Code pre-upgrade fixes
+        run: |
+          CHECKLIST_FILE="/tmp/k8s-upgrade-checklist-${{ inputs.target_version }}.txt"
+          CHECKLIST=""
+          [ -f "$CHECKLIST_FILE" ] && CHECKLIST=$(cat "$CHECKLIST_FILE")
+
+          claude --dangerously-skip-permissions -p "
+          Kubernetes upgrade to ${{ inputs.target_version }} approved.
+          Pre-upgrade checklist:
+          ${CHECKLIST:-No checklist found — scan cluster for compatibility issues with ${{ inputs.target_version }}.}
+
+          Execute every item. This may include:
+          - Upgrading CNI (Cilium) if incompatible
+          - Fixing deprecated APIs in manifests
+          - Upgrading other cluster components
+
+          Per item: execute → verify → stop and report on failure.
+          After all fixes: commit + push, wait 60s for ArgoCD, verify cluster healthy.
+          Post results to Discord webhook $DISCORD_UPGRADE_WEBHOOK." \
+          2>&1 || true
+
+      - name: Verify cluster healthy after fixes
+        run: |
+          NOT_READY=$(kubectl get nodes --no-headers | grep -v ' Ready ' | wc -l)
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "::error::Cluster unhealthy after pre-upgrade fixes"
+            curl -s -X POST "$DISCORD_UPGRADE_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d '{"content": "🔴 **Upgrade Aborted** — Cluster unhealthy after pre-upgrade fixes"}'
+            exit 1
+          fi
+
+  upgrade:
+    name: Run Ansible Upgrade
+    needs: [pre-flight, pre-upgrade-fixes]
+    if: always() && needs.pre-flight.result == 'success' && (needs.pre-upgrade-fixes.result == 'success' || needs.pre-upgrade-fixes.result == 'skipped')
+    runs-on: self-hosted
+    steps:
+      - name: Update Ansible vars
+        run: |
+          cd $K8S_UPGRADE_DIR
+          sed -i 's|k8s_target_version: ".*"|k8s_target_version: "${{ inputs.apt_version }}"|' group_vars/all.yml
+          sed -i 's|k8s_target_semver: ".*"|k8s_target_semver: "${{ inputs.target_version }}"|' group_vars/all.yml
+          grep 'k8s_target' group_vars/all.yml
+
+      - name: Run Ansible playbook
+        run: |
+          cd $K8S_UPGRADE_DIR
+          ansible-playbook upgrade-cluster.yaml \
+            -e ansible_become_pass='${{ secrets.BECOME_PASS }}' 2>&1
+        timeout-minutes: 60
+
+      - name: Discord — upgrade complete
+        if: success()
+        run: |
+          NODES=$(kubectl get nodes -o custom-columns='NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion' --no-headers)
+          curl -s -X POST "$DISCORD_UPGRADE_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"✅ **Ansible Upgrade Complete** — ${{ inputs.target_version }}\\n\`\`\`\\n${NODES}\\n\`\`\`\"}"
+
+      - name: Discord — upgrade failed
+        if: failure()
+        run: |
+          curl -s -X POST "$DISCORD_UPGRADE_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"🔴 **Ansible Upgrade Failed** — ${{ inputs.target_version }}\\n**Logs:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+
+  post-upgrade:
+    name: Post-Upgrade Verification
+    needs: upgrade
+    runs-on: self-hosted
+    steps:
+      - name: Verify all nodes upgraded
+        run: |
+          kubectl get nodes -o wide
+          EXPECTED="${{ inputs.target_version }}"
+          WRONG=$(kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}' | tr ' ' '\n' | grep -v "$EXPECTED" | wc -l)
+          [ "$WRONG" -gt 0 ] && echo "::warning::Not all nodes on $EXPECTED yet"
+
+      - name: Check pod health
+        run: |
+          kubectl get pods -A | grep -v Running | grep -v Completed || echo "All pods healthy"
+
+      - name: Check ArgoCD apps
+        run: |
+          kubectl get applications -n argocd \
+            -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
+
+      - name: Auto-unseal Vault if needed
+        run: |
+          # Adjust secret name/keys to match your Vault unseal secret
+          SEALED=$(kubectl get pods -n vault -o jsonpath='{range .items[*]}{.metadata.name} {.status.containerStatuses[0].ready}{"\n"}{end}' | grep false | awk '{print $1}')
+          if [ -n "$SEALED" ]; then
+            echo "Unsealing: $SEALED"
+            for pod in $SEALED; do
+              for key in key1 key2 key3; do
+                kubectl exec -n vault "$pod" -- vault operator unseal \
+                  "$(kubectl get secret -n vault vault-unseal-keys -o jsonpath="{.data.${key}}" | base64 -d)" 2>/dev/null || true
+              done
+            done
+          else
+            echo "Vault healthy — no unseal needed"
+          fi
+
+      - name: Claude Code post-upgrade diagnosis
+        run: |
+          claude --dangerously-skip-permissions -p "
+          Kubernetes cluster just upgraded to ${{ inputs.target_version }}.
+          1) kubectl get nodes — verify all nodes are on ${{ inputs.target_version }}.
+          2) Check for CrashLoopBackOff or unhealthy pods across all namespaces.
+          3) Diagnose and fix any failing pods if safe to do so.
+          4) Check all ArgoCD applications are Synced and Healthy.
+          5) Post a final report to Discord webhook $DISCORD_UPGRADE_WEBHOOK:
+             - Node versions and status
+             - Pod health summary
+             - ArgoCD status
+             - Issues found and actions taken
+             - Run link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          2>&1 || true
+
+      - name: Final Discord report
+        if: always()
+        run: |
+          NODES=$(kubectl get nodes -o custom-columns='NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion,STATUS:.status.conditions[-1].type' --no-headers)
+          UNHEALTHY=$(kubectl get pods -A --no-headers | grep -v Running | grep -v Completed | wc -l)
+          ARGOCD=$(kubectl get applications -n argocd --no-headers | grep -v "Synced" | wc -l)
+          STATUS="✅" ; MSG="All clear"
+          if [ "$UNHEALTHY" -gt 0 ] || [ "$ARGOCD" -gt 0 ]; then
+            STATUS="⚠️" ; MSG="$UNHEALTHY unhealthy pods, $ARGOCD ArgoCD apps not synced"
+          fi
+          curl -s -X POST "$DISCORD_UPGRADE_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"${STATUS} **K8s Upgrade Complete** — ${{ inputs.target_version }}\\n\\n**Nodes:**\\n\`\`\`\\n${NODES}\\n\`\`\`\\n**Status:** ${MSG}\\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"

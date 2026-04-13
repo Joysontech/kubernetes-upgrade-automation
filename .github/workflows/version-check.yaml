@@ -1,0 +1,152 @@
+name: K8s Version Check
+
+# ── Configure these for your environment ─────────────────────────────────────
+env:
+  DISCORD_UPGRADE_WEBHOOK: ${{ secrets.DISCORD_UPGRADE_WEBHOOK }}
+  RUNNER_USER: YOUR_USERNAME      # SSH user on the self-hosted runner host
+  RUNNER_IP: YOUR_RUNNER_IP       # IP of your self-hosted runner
+  APPROVAL_PORT: 9095             # Port where the approval server listens
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 3 * * 6'  # Saturday 03:00 UTC — version detection
+    - cron: '0 3 * * 0'  # Sunday   03:00 UTC — check for approved minor upgrades
+  workflow_dispatch:
+
+jobs:
+  check-version:
+    name: Check for K8s Updates
+    runs-on: self-hosted
+    steps:
+      - name: Get current cluster version
+        id: current
+        run: |
+          VERSION=$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Current: $VERSION"
+          MAJOR=$(echo "$VERSION" | sed 's/v//' | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | sed 's/v//' | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | sed 's/v//' | cut -d. -f3)
+          echo "major=$MAJOR" >> $GITHUB_OUTPUT
+          echo "minor=$MINOR" >> $GITHUB_OUTPUT
+          echo "patch=$PATCH" >> $GITHUB_OUTPUT
+
+      - name: Check latest patch version
+        id: patch
+        run: |
+          LATEST=$(curl -sL "https://dl.k8s.io/release/stable-${{ steps.current.outputs.major }}.${{ steps.current.outputs.minor }}.txt")
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+          LATEST_PATCH=$(echo "$LATEST" | sed 's/v//' | cut -d. -f3)
+          echo "latest_patch=$LATEST_PATCH" >> $GITHUB_OUTPUT
+          if [ "$LATEST_PATCH" -gt "${{ steps.current.outputs.patch }}" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            RELEASE_DATE=$(curl -s "https://api.github.com/repos/kubernetes/kubernetes/releases/tags/$LATEST" | jq -r '.published_at')
+            AGE_DAYS=$(( ($(date +%s) - $(date -d "$RELEASE_DATE" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$RELEASE_DATE" +%s)) / 86400 ))
+            echo "age_days=$AGE_DAYS" >> $GITHUB_OUTPUT
+            echo "New patch: $LATEST ($AGE_DAYS days old)"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check latest minor version
+        id: minor
+        run: |
+          LATEST_STABLE=$(curl -sL "https://dl.k8s.io/release/stable.txt")
+          LATEST_MINOR=$(echo "$LATEST_STABLE" | sed 's/v//' | cut -d. -f2)
+          NEXT_MINOR=$(( ${{ steps.current.outputs.minor }} + 1 ))
+          echo "next_minor=$NEXT_MINOR" >> $GITHUB_OUTPUT
+          if [ "$LATEST_MINOR" -gt "${{ steps.current.outputs.minor }}" ]; then
+            NEXT_LATEST=$(curl -sL "https://dl.k8s.io/release/stable-${{ steps.current.outputs.major }}.${NEXT_MINOR}.txt" 2>/dev/null || echo "")
+            if [ -n "$NEXT_LATEST" ]; then
+              echo "next_version=$NEXT_LATEST" >> $GITHUB_OUTPUT
+              NEXT_PATCH=$(echo "$NEXT_LATEST" | sed 's/v//' | cut -d. -f3)
+              echo "next_patch=$NEXT_PATCH" >> $GITHUB_OUTPUT
+              [ "$NEXT_PATCH" -ge 2 ] && echo "ready=true" >> $GITHUB_OUTPUT || echo "ready=false" >> $GITHUB_OUTPUT
+            else
+              echo "ready=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "ready=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Auto-upgrade patch (>7 days old)
+        if: steps.patch.outputs.available == 'true' && steps.patch.outputs.age_days >= 7
+        run: |
+          APT_VER="${{ steps.current.outputs.major }}.${{ steps.current.outputs.minor }}.${{ steps.patch.outputs.latest_patch }}-1.1"
+          gh workflow run upgrade-cluster.yaml \
+            -f target_version=${{ steps.patch.outputs.latest }} \
+            -f apt_version=$APT_VER \
+            -f upgrade_type=patch \
+            -f run_pre_fixes=false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify — patch available but too new
+        if: steps.patch.outputs.available == 'true' && steps.patch.outputs.age_days < 7
+        run: |
+          WAIT=$(( 7 - ${{ steps.patch.outputs.age_days }} ))
+          curl -s -X POST "$DISCORD_UPGRADE_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"📋 **K8s Patch Available** — ${{ steps.patch.outputs.latest }} (released ${{ steps.patch.outputs.age_days }}d ago, auto-upgrade in ${WAIT}d)\"}"
+
+      - name: Analyze minor version with Claude Code
+        if: steps.minor.outputs.ready == 'true'
+        run: |
+          claude --dangerously-skip-permissions -p "
+          A new Kubernetes minor version is available.
+          Current: ${{ steps.current.outputs.version }}
+          Target:  ${{ steps.minor.outputs.next_version }}
+
+          1) Fetch the K8s ${{ steps.minor.outputs.next_version }} changelog and release notes.
+          2) List all deprecated/removed APIs, features, and flags.
+          3) List key new features.
+          4) Scan the cluster for deprecated API usage.
+          5) Check Cilium, Rook-Ceph, Vault, and ArgoCD compatibility.
+          6) Write a pre-upgrade checklist to /tmp/k8s-upgrade-checklist-${{ steps.minor.outputs.next_version }}.txt
+          7) Post a detailed report to Discord webhook $DISCORD_UPGRADE_WEBHOOK with sections:
+             NEW FEATURES | DEPRECATIONS | CLUSTER IMPACT | COMPATIBILITY | RISK ASSESSMENT
+             End with: To approve, visit http://${RUNNER_IP}:${APPROVAL_PORT}/approve?version=${{ steps.minor.outputs.next_version }}" \
+          2>&1 || true
+
+      - name: Notify — minor waiting for .2
+        if: steps.minor.outputs.ready == 'false' && steps.minor.outputs.next_version != ''
+        run: |
+          curl -s -X POST "$DISCORD_UPGRADE_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"📋 **K8s Minor Available** — ${{ steps.minor.outputs.next_version }} (waiting for patch .2)\"}"
+
+      - name: Check for approved minor upgrade
+        id: approval
+        run: |
+          APPROVED=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${RUNNER_USER}@${RUNNER_IP} "cat /tmp/k8s-upgrade-approved 2>/dev/null" || echo "")
+          if [ -n "$APPROVED" ]; then
+            echo "approved=true" >> $GITHUB_OUTPUT
+            echo "approved_version=$APPROVED" >> $GITHUB_OUTPUT
+          else
+            echo "approved=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Trigger approved minor upgrade
+        if: steps.approval.outputs.approved == 'true'
+        run: |
+          VERSION="${{ steps.approval.outputs.approved_version }}"
+          PARSED=$(echo "$VERSION" | sed 's/v//')
+          MAJOR=$(echo "$PARSED" | cut -d. -f1)
+          MINOR=$(echo "$PARSED" | cut -d. -f2)
+          PATCH=$(echo "$PARSED" | cut -d. -f3)
+          APT_VER="${MAJOR}.${MINOR}.${PATCH}-1.1"
+          ssh -o StrictHostKeyChecking=no ${RUNNER_USER}@${RUNNER_IP} "rm -f /tmp/k8s-upgrade-approved"
+          gh workflow run upgrade-cluster.yaml \
+            -f target_version=$VERSION \
+            -f apt_version=$APT_VER \
+            -f upgrade_type=minor \
+            -f run_pre_fixes=true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "Current:      ${{ steps.current.outputs.version }}"
+          echo "Latest patch: ${{ steps.patch.outputs.latest }} (available: ${{ steps.patch.outputs.available }})"
+          echo "Minor ready:  ${{ steps.minor.outputs.ready }}"

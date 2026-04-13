@@ -1,0 +1,23 @@
+# Copy to group_vars/all.yml and fill in your values
+# group_vars/all.yml is gitignored — never commit secrets
+
+# Target Kubernetes version (apt package format)
+# Find available: apt-cache madison kubeadm | grep 1.35
+k8s_target_version: "1.35.3-1.1"
+
+# Semver format for kubeadm upgrade apply
+k8s_target_semver: "v1.35.3"
+
+# Discord webhook for Ansible notifications
+# Create: Discord channel → Edit → Integrations → Webhooks
+discord_webhook: "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+
+# Seconds to wait between nodes (do not reduce below 30)
+inter_node_wait: 60
+
+# Health check retries (each waits 10s)
+health_check_retries: 30
+
+# Backup paths on control plane nodes
+etcd_backup_dir: /var/backups/etcd
+pki_backup_dir: /var/backups/kubernetes-pki

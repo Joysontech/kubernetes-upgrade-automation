@@ -1,0 +1,30 @@
+# Copy to inventory.ini and fill in your node IPs
+# inventory.ini is gitignored — never commit real IPs
+
+[control_plane]
+k8s-m01 ansible_host=192.168.1.10
+k8s-m02 ansible_host=192.168.1.11
+k8s-m03 ansible_host=192.168.1.12
+
+[control_plane_first]
+k8s-m01 ansible_host=192.168.1.10
+
+[control_plane_remaining]
+k8s-m02 ansible_host=192.168.1.11
+k8s-m03 ansible_host=192.168.1.12
+
+[workers]
+k8s-w01 ansible_host=192.168.1.20
+k8s-w02 ansible_host=192.168.1.21
+k8s-w03 ansible_host=192.168.1.22
+# k8s-w04 ansible_host=192.168.1.23
+# k8s-w05 ansible_host=192.168.1.24
+
+[k8s:children]
+control_plane
+workers
+
+[all:vars]
+ansible_user=YOUR_USERNAME
+ansible_ssh_private_key_file=~/.ssh/your-k8s-key
+ansible_become=true
